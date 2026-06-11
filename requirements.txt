@@ -1,0 +1,3 @@
+PySide6>=6.5
+pathspec>=0.11
+chardet>=5.0

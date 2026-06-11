@@ -1,0 +1,66 @@
+# Python — directories
+__pycache__/
+venv/
+env/
+.ve*/
+.eggs*
+.egg-info/
+*.egg-info/
+.cache*
+.mypy_cache/
+.pytest_cache*
+.ruff_cache/
+.tox/
+.nox/
+htmlcov/
+build/
+dist/
+pip-wheel-metadata/
+
+# Python — extensions
+*.py[cod]
+*.so
+
+# Frontend — directories
+node_modules/
+.next/
+.nuxt/
+.svelte-kit/
+.parcel-cache/
+.turbo/
+.vercel/
+coverage/
+out/
+
+# Frontend — files
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+bun.lockb
+
+# General — directories
+.git/
+.svn/
+.hg/
+.idea/
+.idea_modules/
+.kilo/
+.cursor/
+.vscode/
+.reports*/
+logs/
+.qwen/
+
+# General — files
+.DS_Store
+Thumbs.db
+.coverage
+
+# Extensions
+*.log
+*.tmp
+
+# Project specific
+project_merged.md
+project_merger.log
+.project_merger_config.json
