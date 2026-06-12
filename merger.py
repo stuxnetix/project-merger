@@ -1,20 +1,31 @@
-"""Core logic: file scanning, filtering, markdown generation."""
+"""Core logic: file collection, binary detection, markdown generation."""
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Iterator
+from typing import Callable
 
 import pathspec
+
+from scanner import FsNode, ScanCancelled, iter_file_nodes, scan_tree
+
+try:  # optional dependency for non-UTF-8 fallback decoding
+    import chardet
+except ImportError:  # pragma: no cover
+    chardet = None
 
 logger = logging.getLogger(__name__)
 
 BINARY_INDICATOR = "[двоичный файл]"
 EMPTY_INDICATOR = "[пустой файл]"
+READ_ERROR_INDICATOR = "*Ошибка чтения файла*"
 
 _CHUNK_SIZE = 8192
 _BINARY_THRESHOLD = 0.30
-_TEXT_BYTES = bytes(range(32, 127)) + b"\n\r\t\f\b"
+# Bytes considered "text": printable ASCII, common whitespace and ALL high bytes
+# (0x80–0xFF) — those are valid letters in legacy encodings such as cp1251;
+# counting them as binary used to mark Russian non-UTF-8 files as [двоичный файл].
+_TEXT_BYTES = bytes(range(32, 127)) + b"\n\r\t\f\b" + bytes(range(128, 256))
 
 LANGUAGE_MAP = {
     ".py": "python",
@@ -122,98 +133,86 @@ def _is_binary(file_path: Path) -> bool:
 
     if not chunk:
         return False
-
     if b"\0" in chunk:
         return True
-
     try:
         chunk.decode("utf-8")
         return False
     except UnicodeDecodeError:
         pass
-
-    nontext = sum(byte not in _TEXT_BYTES for byte in chunk)
+    # bytes.translate with delete table is C-speed, unlike a per-byte Python loop
+    nontext = len(chunk.translate(None, _TEXT_BYTES))
     return (nontext / len(chunk)) > _BINARY_THRESHOLD
 
 
-def _iter_project_files(
-    root: Path, spec: pathspec.PathSpec | None, selected_paths: set[Path]
-) -> Iterator[Path]:
-    for item in root.rglob("*"):
-        if not item.is_file():
-            continue
-        rel_path = item.relative_to(root)
-        if any(part == ".git" for part in rel_path.parts):
-            continue
-        if rel_path.name == ".gitignore":
-            continue
-        if spec and spec.match_file(str(rel_path)):
-            logger.debug("Ignored by .gitignore: %s", rel_path)
-            continue
-        if selected_paths and rel_path not in selected_paths:
-            continue
-        yield item
-
-
-def _build_project_tree(
-    root: Path,
-    spec: pathspec.PathSpec | None,
-    selected_paths: set[Path],
-) -> list[str]:
-    lines: list[str] = []
-    _tree_recurse(root, root, spec, selected_paths, "", lines)
-    return lines
-
-
-def _tree_recurse(
-    root: Path,
-    directory: Path,
-    spec: pathspec.PathSpec | None,
-    selected_paths: set[Path],
-    prefix: str,
-    lines: list[str],
-) -> None:
+def _read_text(file_path: Path) -> str | None:
+    """Read a text file, falling back to chardet for non-UTF-8 encodings."""
     try:
-        entries = sorted(directory.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
-    except PermissionError:
-        return
+        return file_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        if chardet is None:
+            return None
+        try:
+            raw = file_path.read_bytes()
+            encoding = chardet.detect(raw)["encoding"] or "utf-8"
+            return raw.decode(encoding)
+        except (OSError, LookupError, UnicodeDecodeError):
+            return None
 
-    filtered: list[Path] = []
-    for entry in entries:
-        rel = entry.relative_to(root)
-        if rel.parts and rel.parts[0] in (".git",):
-            continue
-        if entry.name == ".gitignore":
-            continue
-        check_path = str(rel) + ("/" if entry.is_dir() else "")
-        if spec and spec.match_file(check_path):
-            continue
-        if selected_paths and entry.is_file() and rel not in selected_paths:
-            continue
-        if selected_paths and entry.is_dir():
-            prefix_match = rel.as_posix() + "/"
-            if not any(p.as_posix().startswith(prefix_match) for p in selected_paths):
-                continue
-        filtered.append(entry)
 
-    for i, entry in enumerate(filtered):
-        is_last = i == len(filtered) - 1
+def _filter_node(node: FsNode, selected: set[str]) -> FsNode | None:
+    """Return a copy of the tree containing only selected files (and their dirs).
+
+    With an empty selection the tree is returned as-is.
+    """
+    if not selected:
+        return node
+    if not node.is_dir:
+        return node if node.rel_path in selected else None
+    kept = [c for c in (_filter_node(ch, selected) for ch in node.children) if c is not None]
+    if not kept:
+        return None
+    return FsNode(name=node.name, rel_path=node.rel_path, is_dir=True, children=kept)
+
+
+def _render_tree_lines(node: FsNode, prefix: str = "", lines: list[str] | None = None) -> list[str]:
+    if lines is None:
+        lines = []
+    for i, child in enumerate(node.children):
+        is_last = i == len(node.children) - 1
         connector = "└── " if is_last else "├── "
-        lines.append(f"{prefix}{connector}{entry.name}{'/' if entry.is_dir() else ''}")
-        if entry.is_dir():
+        lines.append(f"{prefix}{connector}{child.name}{'/' if child.is_dir else ''}")
+        if child.is_dir:
             extension = "    " if is_last else "│   "
-            _tree_recurse(root, entry, spec, selected_paths, prefix + extension, lines)
+            _render_tree_lines(child, prefix + extension, lines)
+    return lines
 
 
 def build_markdown(
     root: Path,
     spec: pathspec.PathSpec | None,
-    selected_paths: set[Path],
+    selected_paths: set[str],
     output_path: Path,
+    cancel_check: Callable[[], bool] | None = None,
+    progress_callback: Callable[[int, str], None] | None = None,
 ) -> int:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    """Generate the merged markdown document.
 
-    files = list(_iter_project_files(root, spec, selected_paths))
+    ``selected_paths`` is a set of POSIX-style relative paths; empty set means
+    "all files". A single pruned filesystem walk feeds both the project tree
+    and the file list. Returns the number of files written.
+
+    Raises :class:`ScanCancelled` if cancelled via ``cancel_check``.
+    """
+    root = Path(root)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_resolved = output_path.resolve()
+
+    fs_root, _ = scan_tree(root, spec, cancel_check=cancel_check)
+    filtered_root = _filter_node(fs_root, selected_paths)
+
+    file_nodes = list(iter_file_nodes(filtered_root)) if filtered_root else []
     files_written = 0
 
     with open(output_path, "w", encoding="utf-8") as out:
@@ -221,41 +220,35 @@ def build_markdown(
         out.write("*Generated by Project Merger*\n\n")
         out.write("---\n\n")
 
-        tree_lines = _build_project_tree(root, spec, selected_paths)
-        if tree_lines:
+        if filtered_root is not None and filtered_root.children:
+            tree_lines = _render_tree_lines(filtered_root)
             out.write("## Структура проекта\n\n```\n")
             out.write(f"{root.name}/\n")
             for line in tree_lines:
                 out.write(line + "\n")
             out.write("```\n\n---\n\n")
 
-        for file_path in files:
-            rel = file_path.relative_to(root)
-            logger.info("Processing: %s", rel)
+        for index, node in enumerate(file_nodes, start=1):
+            if cancel_check is not None and cancel_check():
+                raise ScanCancelled
+            file_path = root / node.rel_path
+            if file_path.resolve() == output_resolved:
+                continue  # never merge the output file into itself
+            if progress_callback is not None:
+                progress_callback(index, node.rel_path)
+            logger.debug("Processing: %s", node.rel_path)
+
+            out.write(f"## {node.rel_path}\n\n")
 
             if _is_binary(file_path):
-                out.write(f"## {rel}\n\n{BINARY_INDICATOR}\n\n")
+                out.write(f"{BINARY_INDICATOR}\n\n")
                 files_written += 1
                 continue
 
-            try:
-                content = file_path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                try:
-                    import chardet
-
-                    raw = file_path.read_bytes()
-                    encoding = chardet.detect(raw)["encoding"] or "utf-8"
-                    content = raw.decode(encoding)
-                except Exception:
-                    out.write(f"## {rel}\n\n{BINARY_INDICATOR}\n\n")
-                    continue
-            except OSError as e:
-                logger.error("Read error %s: %s", rel, e)
-                out.write(f"## {rel}\n\n*Ошибка чтения файла*\n\n")
+            content = _read_text(file_path)
+            if content is None:
+                out.write(f"{READ_ERROR_INDICATOR}\n\n")
                 continue
-
-            out.write(f"## {rel}\n\n")
 
             if not content.strip():
                 out.write(f"{EMPTY_INDICATOR}\n\n")

@@ -64,3 +64,7 @@ Thumbs.db
 project_merged.md
 project_merger.log
 .project_merger_config.json
+
+# Добавлено Project Merger
+.env
+.venv/

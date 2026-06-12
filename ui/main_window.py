@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QDragEnterEvent, QDropEvent
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -25,10 +25,19 @@ from PySide6.QtWidgets import (
 
 from config import Config
 from gitignore_handler import create_default_gitignore, get_combined_spec, get_gitignore_spec
+from scanner import FsNode
 from ui.rules_dialog import RulesDialog
-from ui.workers import MergerWorker
+from ui.workers import MergerWorker, ScanWorker
 
 logger = logging.getLogger(__name__)
+
+ROLE_REL_PATH = Qt.UserRole
+ROLE_IS_DIR = Qt.UserRole + 1
+
+PAGE_DROP = 0
+PAGE_CONTENT = 1
+TREE_PAGE_LOADING = 0
+TREE_PAGE_TREE = 1
 
 TREE_STYLE = """
 QTreeWidget {
@@ -171,16 +180,19 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.config = config
         self.root_path: Path | None = None
-        self.spec = None
         self.combined_spec = None
-        self.selected_paths: set[Path] = set()
-        self.worker: MergerWorker | None = None
-        self._scan_count = 0
-        self._scan_cancelled = False
+        self.selected_paths: set[str] = set()
+        self.scan_worker: ScanWorker | None = None
+        self.merge_worker: MergerWorker | None = None
 
         self.setWindowTitle("Project Merger")
         self.resize(900, 700)
         self.setAcceptDrops(True)
+
+        style = QApplication.style()
+        self._dir_icon: QIcon = style.standardIcon(QStyle.SP_DirIcon)
+        self._dir_open_icon: QIcon = style.standardIcon(QStyle.SP_DirOpenIcon)
+        self._file_icon: QIcon = style.standardIcon(QStyle.SP_FileIcon)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -304,13 +316,14 @@ class MainWindow(QMainWindow):
         self.tree.header().setSectionResizeMode(QHeaderView.Stretch)
         self.tree.header().setVisible(False)
         self.tree.setAlternatingRowColors(True)
-        self.tree.setAnimated(True)
+        # Animations are O(visible items) per expand — disabled for large trees.
+        self.tree.setAnimated(False)
         self.tree.setIndentation(20)
         self.tree.setStyleSheet(TREE_STYLE)
         self.tree.itemChanged.connect(self._on_item_changed)
         self.tree_stack.addWidget(self.tree)
 
-        self.tree_stack.setCurrentIndex(1)
+        self.tree_stack.setCurrentIndex(TREE_PAGE_TREE)
         content_layout.addWidget(self.tree_stack)
 
         btn_layout = QHBoxLayout()
@@ -356,7 +369,7 @@ class MainWindow(QMainWindow):
             }
         """)
 
-        self.stack.setCurrentIndex(0)
+        self.stack.setCurrentIndex(PAGE_DROP)
         self._update_buttons()
 
     # ───────── Drag & drop on the whole window ─────────
@@ -379,6 +392,9 @@ class MainWindow(QMainWindow):
     # ───────── Project loading ─────────
 
     def _load_project(self, dir_path: str) -> None:
+        logger.info("Loading project: %s", dir_path)
+        self._stop_scan_worker()
+
         self.root_path = Path(dir_path)
         self.config.last_source_dir = str(self.root_path)
         self.folder_label.setText(str(self.root_path))
@@ -393,20 +409,12 @@ class MainWindow(QMainWindow):
                 QMessageBox.Yes,
             )
             if reply == QMessageBox.Yes:
-                created = create_default_gitignore(
-                    self.root_path, self.config.default_gitignore_patterns
-                )
-                if created:
-                    spec = get_gitignore_spec(self.root_path)
-        self.spec = spec
-        self.combined_spec = get_combined_spec(self.root_path, self.config.default_gitignore_patterns)
-        self.stack.setCurrentIndex(1)
-        self.tree_stack.setCurrentIndex(0)
-        self.statusBar().showMessage("Сканирование файлов...")
-        QApplication.processEvents()
-        self._populate_tree()
-        self.tree_stack.setCurrentIndex(1)
-        self.statusBar().showMessage(f"Загружен проект: {self.root_path}")
+                create_default_gitignore(self.root_path, self.config.gitignore_patterns)
+
+        self.combined_spec = get_combined_spec(self.root_path, self.config.gitignore_patterns)
+        logger.info("Combined spec: %d patterns", len(self.combined_spec.patterns))
+
+        self._start_scan()
 
     def _choose_folder(self) -> None:
         dir_path = QFileDialog.getExistingDirectory(
@@ -416,139 +424,122 @@ class MainWindow(QMainWindow):
             return
         self._load_project(dir_path)
 
-    # ───────── Tree population ─────────
+    # ───────── Scanning (background thread) ─────────
 
-    def _cancel_scan(self) -> None:
-        self._scan_cancelled = True
-        self.statusBar().showMessage("Сканирование отменено")
-        self.stack.setCurrentIndex(0)
-
-    def closeEvent(self, event) -> None:
-        self._scan_cancelled = True
-        if self.worker and self.worker.isRunning():
-            self.worker.quit()
-            self.worker.wait(3000)
-        event.accept()
-
-    def _populate_tree(self) -> None:
+    def _start_scan(self) -> None:
         if self.root_path is None:
             return
-        self.tree.clear()
-        self.selected_paths.clear()
-        self._scan_count = 0
-        self._scan_cancelled = False
+        self._stop_scan_worker()
+
+        self.stack.setCurrentIndex(PAGE_CONTENT)
+        self.tree_stack.setCurrentIndex(TREE_PAGE_LOADING)
+        self.loading_label.setText("⏳  Сканирование файловой системы...")
+        self.statusBar().showMessage("Сканирование файлов...")
+        self._set_controls_enabled(False)
+
+        self.scan_worker = ScanWorker(self.root_path, self.combined_spec, parent=self)
+        self.scan_worker.scan_done.connect(self._on_scan_done)
+        self.scan_worker.scan_failed.connect(self._on_scan_failed)
+        self.scan_worker.scan_progress.connect(self._on_scan_progress)
+        self.scan_worker.start()
+
+    def _stop_scan_worker(self) -> None:
+        if self.scan_worker is not None:
+            self.scan_worker.cancel()
+            self.scan_worker.wait(5000)
+            self.scan_worker = None
+
+    def _cancel_scan(self) -> None:
+        logger.info("Scan cancelled by user")
+        self._stop_scan_worker()
+        self.statusBar().showMessage("Сканирование отменено")
+        self.stack.setCurrentIndex(PAGE_DROP)
+
+    def _on_scan_progress(self, count: int, rel_path: str) -> None:
+        self.loading_label.setText(f"⏳  Сканирование: {count} элементов...")
+        self.statusBar().showMessage(f"Сканирование: {rel_path}  ({count})")
+
+    def _on_scan_failed(self, message: str) -> None:
+        self.scan_worker = None
+        self._set_controls_enabled(True)
+        self.statusBar().showMessage("Ошибка сканирования")
+        self.stack.setCurrentIndex(PAGE_DROP)
+        QMessageBox.critical(self, "Ошибка сканирования", message)
+
+    def _on_scan_done(self, fs_root: FsNode, count: int) -> None:
+        self.scan_worker = None
+        self._populate_tree(fs_root)
+        self.tree_stack.setCurrentIndex(TREE_PAGE_TREE)
+        self._set_controls_enabled(True)
+        self.statusBar().showMessage(f"Загружен проект: {self.root_path}  ({count} элементов)")
+
+    # ───────── Tree population ─────────
+
+    def _populate_tree(self, fs_root: FsNode) -> None:
+        """Build the QTreeWidget from the scanned tree.
+
+        Items are built detached and attached once; signals are blocked for the
+        whole rebuild, so itemChanged never fires during population (this used
+        to cause an O(n²) re-walk of the tree per added item).
+        """
+        self.tree.blockSignals(True)
         self.tree.setUpdatesEnabled(False)
         try:
-            root_item = QTreeWidgetItem(self.tree, [self.root_path.name])
-            root_item.setData(0, Qt.UserRole, self.root_path)
-            root_item.setIcon(0, QApplication.style().standardIcon(QStyle.SP_DirOpenIcon))
-            self._add_subtree(root_item, self.root_path)
-            if self._scan_cancelled:
-                return
-            root_item.setExpanded(True)
+            self.tree.clear()
+            self.selected_paths.clear()
 
-            self.tree.blockSignals(True)
-            self._set_check_state(root_item, Qt.Checked)
-            self._uncheck_ignored()
-            self.tree.blockSignals(False)
+            root_item = QTreeWidgetItem([fs_root.name])
+            root_item.setData(0, ROLE_REL_PATH, fs_root.rel_path)
+            root_item.setData(0, ROLE_IS_DIR, True)
+            root_item.setFlags(root_item.flags() | Qt.ItemIsUserCheckable)
+            root_item.setCheckState(0, Qt.Checked)
+            root_item.setIcon(0, self._dir_open_icon)
+            self._build_items(root_item, fs_root)
+
+            self.tree.addTopLevelItem(root_item)
+            root_item.setExpanded(True)
+            self._rebuild_selected()
         finally:
             self.tree.setUpdatesEnabled(True)
+            self.tree.blockSignals(False)
+        self._update_buttons()
 
-    def _uncheck_ignored(self) -> None:
-        root = self.tree.invisibleRootItem()
-        for i in range(root.childCount()):
-            self._uncheck_recursive(root.child(i))
+    def _build_items(self, parent_item: QTreeWidgetItem, node: FsNode) -> None:
+        for child in node.children:
+            item = QTreeWidgetItem(parent_item, [child.name])
+            item.setData(0, ROLE_REL_PATH, child.rel_path)
+            item.setData(0, ROLE_IS_DIR, child.is_dir)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(0, Qt.Checked)
+            item.setIcon(0, self._dir_icon if child.is_dir else self._file_icon)
+            if child.is_dir:
+                self._build_items(item, child)
 
-    def _uncheck_recursive(self, item: QTreeWidgetItem) -> None:
-        if self._scan_cancelled:
-            return
-        entry: Path = item.data(0, Qt.UserRole)
-        if entry:
-            rel = entry.relative_to(self.root_path)
-            check_path = str(rel) + ("/" if entry.is_dir() else "")
-            if self.combined_spec and self.combined_spec.match_file(check_path):
-                self._set_check_state(item, Qt.Unchecked)
-                self._update_parent_states(item)
-                return
-        for i in range(item.childCount()):
-            self._uncheck_recursive(item.child(i))
-
-    def _add_subtree(self, parent_item: QTreeWidgetItem, directory: Path) -> None:
-        try:
-            entries = sorted(directory.iterdir(), key=lambda p: (p.is_file(), p.name))
-        except PermissionError:
-            return
-
-        for entry in entries:
-            if self._scan_cancelled:
-                return
-            if entry.name in (".git", ".gitignore"):
-                continue
-
-            rel = entry.relative_to(self.root_path)
-            check_path = str(rel) + ("/" if entry.is_dir() else "")
-            if self.combined_spec and self.combined_spec.match_file(check_path):
-                continue
-
-            self._scan_count += 1
-            if self._scan_count % 30 == 0:
-                self.statusBar().showMessage(f"Сканирование: {rel}  ({self._scan_count})")
-                QApplication.processEvents()
-
-            item = QTreeWidgetItem(parent_item)
-            item.setText(0, entry.name)
-            item.setData(0, Qt.UserRole, entry)
-            item.setFlags(
-                item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsAutoTristate
-            )
-            item.setCheckState(0, Qt.Unchecked)
-
-            if entry.is_dir():
-                item.setIcon(0, QApplication.style().standardIcon(QStyle.SP_DirIcon))
-                self._add_subtree(item, entry)
-            else:
-                item.setIcon(0, QApplication.style().standardIcon(QStyle.SP_FileIcon))
+    # ───────── Selection handling ─────────
 
     def _set_check_state(self, item: QTreeWidgetItem, state: Qt.CheckState) -> None:
         item.setCheckState(0, state)
-        self._update_selected(item)
         for i in range(item.childCount()):
             self._set_check_state(item.child(i), state)
 
-    def _update_selected(self, item: QTreeWidgetItem) -> None:
-        entry: Path = item.data(0, Qt.UserRole)
-        if entry is None:
-            return
-        rel = entry.relative_to(self.root_path)
-        if item.checkState(0) == Qt.Checked:
-            if entry.is_file():
-                self.selected_paths.add(rel)
-        else:
-            self.selected_paths.discard(rel)
-            for child in self._get_all_items(item):
-                child_entry = child.data(0, Qt.UserRole)
-                if child_entry and child_entry.is_file():
-                    self.selected_paths.discard(
-                        child_entry.relative_to(self.root_path)
-                    )
-
-    def _get_all_items(self, item: QTreeWidgetItem) -> list[QTreeWidgetItem]:
-        result = []
-        for i in range(item.childCount()):
-            child = item.child(i)
-            result.append(child)
-            result.extend(self._get_all_items(child))
-        return result
+    def _rebuild_selected(self) -> None:
+        self.selected_paths.clear()
+        root = self.tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            self._collect_from_item(root.child(i), self.selected_paths)
 
     def _on_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
         if column != 0:
             return
         self.tree.blockSignals(True)
-        state = item.checkState(0)
-        if state != Qt.PartiallyChecked:
-            self._set_check_state(item, state)
-        self._update_parent_states(item)
-        self.tree.blockSignals(False)
+        try:
+            state = item.checkState(0)
+            if state != Qt.PartiallyChecked:
+                self._set_check_state(item, state)
+            self._update_parent_states(item)
+            self._rebuild_selected()
+        finally:
+            self.tree.blockSignals(False)
         self._update_buttons()
 
     def _update_parent_states(self, item: QTreeWidgetItem) -> None:
@@ -570,53 +561,51 @@ class MainWindow(QMainWindow):
                 parent.setCheckState(0, Qt.PartiallyChecked)
             parent = parent.parent()
 
-    def _collect_selected_files(self) -> set[Path]:
-        selected = set()
-        root = self.tree.invisibleRootItem()
-        for i in range(root.childCount()):
-            self._collect_from_item(root.child(i), selected)
-        return selected
-
-    def _collect_from_item(self, item: QTreeWidgetItem, selected: set[Path]) -> None:
-        entry: Path = item.data(0, Qt.UserRole)
-        if entry and entry.is_file() and item.checkState(0) == Qt.Checked:
-            selected.add(entry.relative_to(self.root_path))
+    def _collect_from_item(self, item: QTreeWidgetItem, selected: set[str]) -> None:
+        # is_dir is stored at scan time — no filesystem stat() calls here.
+        is_dir = bool(item.data(0, ROLE_IS_DIR))
+        rel_path = item.data(0, ROLE_REL_PATH)
+        if not is_dir and rel_path and item.checkState(0) == Qt.Checked:
+            selected.add(rel_path)
         for i in range(item.childCount()):
             self._collect_from_item(item.child(i), selected)
 
     def _select_all(self) -> None:
-        root = self.tree.invisibleRootItem()
-        if root.childCount() > 0:
-            self.tree.blockSignals(True)
-            self._set_check_state(root.child(0), Qt.Checked)
-            self._update_parent_states(root.child(0))
-            self.tree.blockSignals(False)
+        self._set_all_checked(Qt.Checked)
 
     def _deselect_all(self) -> None:
+        self._set_all_checked(Qt.Unchecked)
+
+    def _set_all_checked(self, state: Qt.CheckState) -> None:
         root = self.tree.invisibleRootItem()
-        if root.childCount() > 0:
-            self.tree.blockSignals(True)
-            self._set_check_state(root.child(0), Qt.Unchecked)
-            self._update_parent_states(root.child(0))
+        if root.childCount() == 0:
+            return
+        self.tree.blockSignals(True)
+        try:
+            self._set_check_state(root.child(0), state)
+            self._rebuild_selected()
+        finally:
             self.tree.blockSignals(False)
+        self._update_buttons()
+
+    # ───────── Merging (background thread) ─────────
 
     def _merge_all(self) -> None:
-        self.selected_paths = set()
-        self._run_merger(spec=self.combined_spec)
+        self._run_merger(spec=self.combined_spec, selected=set())
 
     def _merge_selected(self) -> None:
-        self.selected_paths = self._collect_selected_files()
-        if not self.selected_paths:
+        selected = set(self.selected_paths)
+        logger.info("Merge selected: %d files", len(selected))
+        if not selected:
             QMessageBox.warning(self, "Нет файлов", "Не выбрано ни одного файла.")
             return
-        self._run_merger(spec=None)
+        self._run_merger(spec=self.combined_spec, selected=selected)
 
-    def _run_merger(self, spec=None) -> None:
+    def _run_merger(self, spec, selected: set[str]) -> None:
         if self.root_path is None:
             QMessageBox.warning(self, "Ошибка", "Сначала выберите папку проекта.")
             return
-
-        if self.worker and self.worker.isRunning():
+        if self.merge_worker is not None and self.merge_worker.isRunning():
             QMessageBox.warning(self, "Занято", "Генерация уже выполняется. Дождитесь завершения.")
             return
 
@@ -630,28 +619,31 @@ class MainWindow(QMainWindow):
             return
         output = Path(save_path)
         self.config.last_output_dir = str(output.parent)
-        self.config.save()
 
         self.statusBar().showMessage("Сборка проекта...")
         self._set_merge_buttons_enabled(False)
-        self.worker = MergerWorker(self.root_path, spec, self.selected_paths, output)
-        self.worker.finished.connect(self._on_merge_finished)
-        self.worker.error.connect(self._on_merge_error)
-        self.worker.start()
+        self.merge_worker = MergerWorker(self.root_path, spec, selected, output, parent=self)
+        self.merge_worker.merge_done.connect(self._on_merge_done)
+        self.merge_worker.merge_failed.connect(self._on_merge_failed)
+        self.merge_worker.merge_progress.connect(self._on_merge_progress)
+        self.merge_worker.start()
 
-    def _set_merge_buttons_enabled(self, enabled: bool) -> None:
-        self.merge_all_btn.setEnabled(enabled)
-        self.merge_selected_btn.setEnabled(enabled)
+    def _on_merge_progress(self, index: int, rel_path: str) -> None:
+        self.statusBar().showMessage(f"Сборка: {rel_path}  ({index})")
 
-    def _on_merge_finished(self, file_count: int) -> None:
+    def _on_merge_done(self, file_count: int) -> None:
+        self.merge_worker = None
         self._set_merge_buttons_enabled(True)
         self.statusBar().showMessage(f"Готово. Обработано файлов: {file_count}")
         QMessageBox.information(self, "Успех", f"Файл сохранён.\nФайлов обработано: {file_count}")
 
-    def _on_merge_error(self, message: str) -> None:
+    def _on_merge_failed(self, message: str) -> None:
+        self.merge_worker = None
         self._set_merge_buttons_enabled(True)
         self.statusBar().showMessage("Ошибка")
         QMessageBox.critical(self, "Ошибка", message)
+
+    # ───────── Rules / .gitignore ─────────
 
     def _update_gitignore(self) -> None:
         if self.root_path is None:
@@ -675,7 +667,7 @@ class MainWindow(QMainWindow):
             return
 
         new_patterns = [
-            p for p in self.config.default_gitignore_patterns
+            p for p in self.config.gitignore_patterns
             if p not in existing_patterns
         ]
         if not new_patterns:
@@ -691,32 +683,47 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Ошибка", f"Не удалось записать .gitignore:\n{e}")
             return
 
-        self.spec = get_gitignore_spec(self.root_path)
-        self.combined_spec = get_combined_spec(self.root_path, self.config.default_gitignore_patterns)
-        self._populate_tree()
+        self.combined_spec = get_combined_spec(self.root_path, self.config.gitignore_patterns)
         self.statusBar().showMessage(".gitignore обновлён")
         QMessageBox.information(
             self, "Готово",
             f"Добавлены правила исключений в .gitignore ({len(new_patterns)} шт.)."
         )
+        self._start_scan()
 
     def _edit_rules(self) -> None:
-        dialog = RulesDialog(self.config.default_gitignore_patterns, self)
+        dialog = RulesDialog(self.config.gitignore_patterns, self)
         if dialog.exec() != RulesDialog.Accepted:
             return
-        new_patterns = dialog.get_patterns()
-        self.config.data["default_gitignore"] = new_patterns
-        self.config.save()
+        self.config.set_gitignore_patterns(dialog.get_patterns())
         if self.root_path is not None:
-            self.combined_spec = get_combined_spec(self.root_path, new_patterns)
-            self._populate_tree()
+            self.combined_spec = get_combined_spec(self.root_path, self.config.gitignore_patterns)
             self.statusBar().showMessage("Правила обновлены")
+            self._start_scan()
 
-    def _update_buttons(self) -> None:
-        enabled = self.root_path is not None
-        self.select_all_btn.setEnabled(enabled)
-        self.deselect_all_btn.setEnabled(enabled)
+    # ───────── Misc ─────────
+
+    def _set_merge_buttons_enabled(self, enabled: bool) -> None:
         self.merge_all_btn.setEnabled(enabled)
         self.merge_selected_btn.setEnabled(enabled)
-        self.update_gitignore_btn.setEnabled(enabled)
-        self.rules_btn.setEnabled(enabled)
+
+    def _set_controls_enabled(self, enabled: bool) -> None:
+        for btn in (
+            self.select_all_btn,
+            self.deselect_all_btn,
+            self.merge_all_btn,
+            self.merge_selected_btn,
+            self.update_gitignore_btn,
+            self.rules_btn,
+        ):
+            btn.setEnabled(enabled)
+
+    def _update_buttons(self) -> None:
+        self._set_controls_enabled(self.root_path is not None)
+
+    def closeEvent(self, event) -> None:
+        self._stop_scan_worker()
+        if self.merge_worker is not None and self.merge_worker.isRunning():
+            self.merge_worker.cancel()
+            self.merge_worker.wait(5000)
+        event.accept()
