@@ -13,17 +13,18 @@ from PySide6.QtWidgets import (
 )
 
 from config import DEFAULT_GITIGNORE_PATTERNS
+from i18n import tr
 
 
 class RulesDialog(QDialog):
     def __init__(self, patterns: list[str], parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Правила исключений")
+        self.setWindowTitle(tr("rules_title"))
         self.resize(500, 440)
 
         layout = QVBoxLayout(self)
 
-        layout.addWidget(QLabel("Шаблон правил для исключения файлов и папок:"))
+        layout.addWidget(QLabel(tr("rules_hint")))
 
         self.list_widget = QListWidget()
         self.list_widget.addItems(patterns)
@@ -31,18 +32,18 @@ class RulesDialog(QDialog):
 
         add_layout = QHBoxLayout()
         self.add_input = QLineEdit()
-        self.add_input.setPlaceholderText("Новое правило (например, *.log или temp/)")
+        self.add_input.setPlaceholderText(tr("rules_placeholder"))
         self.add_input.returnPressed.connect(self._add_rule)
-        add_btn = QPushButton("Добавить")
+        add_btn = QPushButton(tr("rules_add"))
         add_btn.clicked.connect(self._add_rule)
         add_layout.addWidget(self.add_input)
         add_layout.addWidget(add_btn)
         layout.addLayout(add_layout)
 
         actions_layout = QHBoxLayout()
-        remove_btn = QPushButton("Удалить выбранное")
+        remove_btn = QPushButton(tr("rules_remove"))
         remove_btn.clicked.connect(self._remove_selected)
-        reset_btn = QPushButton("Сбросить к стандартным")
+        reset_btn = QPushButton(tr("rules_reset"))
         reset_btn.clicked.connect(self._reset_to_defaults)
         actions_layout.addWidget(remove_btn)
         actions_layout.addWidget(reset_btn)
@@ -50,10 +51,10 @@ class RulesDialog(QDialog):
         layout.addLayout(actions_layout)
 
         btn_layout = QHBoxLayout()
-        ok_btn = QPushButton("OK")
+        ok_btn = QPushButton(tr("ok"))
         ok_btn.setDefault(True)
         ok_btn.clicked.connect(self.accept)
-        cancel_btn = QPushButton("Отмена")
+        cancel_btn = QPushButton(tr("cancel"))
         cancel_btn.clicked.connect(self.reject)
         btn_layout.addStretch()
         btn_layout.addWidget(ok_btn)
@@ -76,8 +77,8 @@ class RulesDialog(QDialog):
     def _reset_to_defaults(self) -> None:
         reply = QMessageBox.question(
             self,
-            "Сбросить правила",
-            "Заменить текущий список стандартным набором правил?",
+            tr("rules_reset_title"),
+            tr("rules_reset_text"),
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )

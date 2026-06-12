@@ -8,6 +8,7 @@ from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
 
+import i18n
 from config import Config
 from ui.main_window import MainWindow
 
@@ -58,6 +59,7 @@ def main() -> None:
     logger.info("=== Application starting ===")
     app = QApplication(sys.argv)
     config = Config()
+    i18n.set_language(config.language)
     window = MainWindow(config)
     window.show()
     logger.info("=== Main window shown ===")

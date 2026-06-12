@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
 import pathspec
 
+from i18n import tr
+from sanitizer import Finding, sanitize_text
 from scanner import FsNode, ScanCancelled, iter_file_nodes, scan_tree
 
 try:  # optional dependency for non-UTF-8 fallback decoding
@@ -16,9 +19,26 @@ except ImportError:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
-BINARY_INDICATOR = "[двоичный файл]"
-EMPTY_INDICATOR = "[пустой файл]"
-READ_ERROR_INDICATOR = "*Ошибка чтения файла*"
+
+@dataclass
+class MergeResult:
+    """Outcome of :func:`build_markdown`."""
+
+    files_written: int = 0
+    total_chars: int = 0                 # embedded content size (for token estimate)
+    sanitized: bool = False
+    findings: dict[str, list[Finding]] = field(default_factory=dict)  # rel_path -> findings
+    skipped_oversize: list[str] = field(default_factory=list)
+
+    @property
+    def findings_count(self) -> int:
+        return sum(len(v) for v in self.findings.values())
+
+    @property
+    def token_estimate(self) -> int:
+        """Rough LLM token estimate (≈4 chars/token for code)."""
+        return self.total_chars // 4
+
 
 _CHUNK_SIZE = 8192
 _BINARY_THRESHOLD = 0.30
@@ -195,12 +215,16 @@ def build_markdown(
     output_path: Path,
     cancel_check: Callable[[], bool] | None = None,
     progress_callback: Callable[[int, str], None] | None = None,
-) -> int:
+    sanitize: bool = False,
+    max_file_size_kb: int = 0,
+) -> MergeResult:
     """Generate the merged markdown document.
 
     ``selected_paths`` is a set of POSIX-style relative paths; empty set means
     "all files". A single pruned filesystem walk feeds both the project tree
-    and the file list. Returns the number of files written.
+    and the file list. With ``sanitize=True`` secrets are masked via
+    :mod:`sanitizer`; ``max_file_size_kb > 0`` skips larger files with a note.
+    Returns a :class:`MergeResult`.
 
     Raises :class:`ScanCancelled` if cancelled via ``cancel_check``.
     """
@@ -213,7 +237,7 @@ def build_markdown(
     filtered_root = _filter_node(fs_root, selected_paths)
 
     file_nodes = list(iter_file_nodes(filtered_root)) if filtered_root else []
-    files_written = 0
+    result = MergeResult(sanitized=sanitize)
 
     with open(output_path, "w", encoding="utf-8") as out:
         out.write(f"# Project: {root.name}\n\n")
@@ -222,7 +246,7 @@ def build_markdown(
 
         if filtered_root is not None and filtered_root.children:
             tree_lines = _render_tree_lines(filtered_root)
-            out.write("## Структура проекта\n\n```\n")
+            out.write(f"## {tr('doc_tree_header')}\n\n```\n")
             out.write(f"{root.name}/\n")
             for line in tree_lines:
                 out.write(line + "\n")
@@ -240,20 +264,36 @@ def build_markdown(
 
             out.write(f"## {node.rel_path}\n\n")
 
+            if max_file_size_kb > 0:
+                try:
+                    size_kb = file_path.stat().st_size // 1024
+                except OSError:
+                    size_kb = 0
+                if size_kb > max_file_size_kb:
+                    out.write(tr("doc_skipped_size", size=size_kb, limit=max_file_size_kb) + "\n\n")
+                    result.skipped_oversize.append(node.rel_path)
+                    result.files_written += 1
+                    continue
+
             if _is_binary(file_path):
-                out.write(f"{BINARY_INDICATOR}\n\n")
-                files_written += 1
+                out.write(f"{tr('doc_binary')}\n\n")
+                result.files_written += 1
                 continue
 
             content = _read_text(file_path)
             if content is None:
-                out.write(f"{READ_ERROR_INDICATOR}\n\n")
+                out.write(f"{tr('doc_read_error')}\n\n")
                 continue
 
             if not content.strip():
-                out.write(f"{EMPTY_INDICATOR}\n\n")
-                files_written += 1
+                out.write(f"{tr('doc_empty')}\n\n")
+                result.files_written += 1
                 continue
+
+            if sanitize:
+                content, findings = sanitize_text(content)
+                if findings:
+                    result.findings[node.rel_path] = findings
 
             lang = _get_language(file_path)
             out.write(f"```{lang}\n")
@@ -261,7 +301,14 @@ def build_markdown(
             if not content.endswith("\n"):
                 out.write("\n")
             out.write("```\n\n")
-            files_written += 1
+            result.total_chars += len(content)
+            result.files_written += 1
 
-    logger.info("Generated %s with %d files", output_path, files_written)
-    return files_written
+        if sanitize and result.findings_count:
+            out.write(tr("doc_sanitize_note", n=result.findings_count) + "\n")
+
+    logger.info(
+        "Generated %s with %d files (sanitized=%s, masked=%d)",
+        output_path, result.files_written, sanitize, result.findings_count,
+    )
+    return result

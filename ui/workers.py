@@ -65,26 +65,39 @@ class ScanWorker(CancellableWorker):
 class MergerWorker(CancellableWorker):
     """Generates the merged markdown document off the GUI thread."""
 
-    merge_done = Signal(int)  # files written
+    merge_done = Signal(object)  # MergeResult
     merge_failed = Signal(str)
     merge_progress = Signal(int, str)  # (file index, relative path)
 
-    def __init__(self, root: Path, spec, selected: set[str], output: Path, parent=None) -> None:
+    def __init__(
+        self,
+        root: Path,
+        spec,
+        selected: set[str],
+        output: Path,
+        sanitize: bool = False,
+        max_file_size_kb: int = 0,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self._root = root
         self._spec = spec
         self._selected = selected
         self._output = output
+        self._sanitize = sanitize
+        self._max_file_size_kb = max_file_size_kb
 
     def run(self) -> None:
         try:
-            count = build_markdown(
+            result = build_markdown(
                 self._root,
                 self._spec,
                 self._selected,
                 self._output,
                 cancel_check=self.is_cancelled,
                 progress_callback=self.merge_progress.emit,
+                sanitize=self._sanitize,
+                max_file_size_kb=self._max_file_size_kb,
             )
         except ScanCancelled:
             logger.info("Merge cancelled by user")
@@ -94,4 +107,4 @@ class MergerWorker(CancellableWorker):
             self.merge_failed.emit(str(e))
             return
         if not self.is_cancelled():
-            self.merge_done.emit(count)
+            self.merge_done.emit(result)

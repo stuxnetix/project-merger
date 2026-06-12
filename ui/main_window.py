@@ -6,14 +6,16 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QIcon
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QGuiApplication, QIcon
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QStackedWidget,
@@ -24,10 +26,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import i18n
 from config import Config
 from gitignore_handler import create_default_gitignore, get_combined_spec, get_gitignore_spec
+from i18n import tr
+from merger import MergeResult
 from scanner import FsNode
 from ui.rules_dialog import RulesDialog
+from ui.settings_dialog import SettingsDialog
 from ui.workers import MergerWorker, ScanWorker
 
 logger = logging.getLogger(__name__)
@@ -122,6 +128,7 @@ class DropZone(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.setAcceptDrops(True)
+        self._suppress_click = False
 
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignCenter)
@@ -135,13 +142,13 @@ class DropZone(QWidget):
         plus.setAlignment(Qt.AlignCenter)
         plus.setStyleSheet("font-size: 40px; color: #64B5F6; font-weight: 300; margin-top: -8px;")
 
-        text = QLabel("Перетащите проект сюда\nили нажмите чтобы открыть")
-        text.setAlignment(Qt.AlignCenter)
-        text.setStyleSheet("font-size: 15px; color: #546E7A; font-family: 'Segoe UI', system-ui, sans-serif;")
+        self.text = QLabel(tr("drop_text"))
+        self.text.setAlignment(Qt.AlignCenter)
+        self.text.setStyleSheet("font-size: 15px; color: #546E7A; font-family: 'Segoe UI', system-ui, sans-serif;")
 
         layout.addWidget(icon)
         layout.addWidget(plus)
-        layout.addWidget(text)
+        layout.addWidget(self.text)
 
         self.setStyleSheet("""
             DropZone {
@@ -171,9 +178,15 @@ class DropZone(QWidget):
                 self.directory_selected.emit(str(path))
 
     def mousePressEvent(self, event) -> None:
-        dir_path = QFileDialog.getExistingDirectory(self, "Выберите папку проекта")
+        if self._suppress_click:  # click landed on the recent-projects button
+            self._suppress_click = False
+            return
+        dir_path = QFileDialog.getExistingDirectory(self, tr("choose_folder_dialog"))
         if dir_path:
             self.directory_selected.emit(dir_path)
+
+    def retranslate(self) -> None:
+        self.text.setText(tr("drop_text"))
 
 
 class MainWindow(QMainWindow):
@@ -185,8 +198,9 @@ class MainWindow(QMainWindow):
         self.selected_paths: set[str] = set()
         self.scan_worker: ScanWorker | None = None
         self.merge_worker: MergerWorker | None = None
+        self.last_output_path: Path | None = None
 
-        self.setWindowTitle("Project Merger")
+        self.setWindowTitle(tr("app_title"))
         self.resize(900, 700)
         self.setAcceptDrops(True)
 
@@ -220,7 +234,7 @@ class MainWindow(QMainWindow):
         self.folder_icon = QLabel("📁")
         self.folder_icon.setStyleSheet("font-size: 18px;")
 
-        self.folder_label = QLabel("Проект не выбран")
+        self.folder_label = QLabel(tr("no_project"))
         self.folder_label.setStyleSheet("""
             QLabel {
                 font-size: 14px;
@@ -231,7 +245,7 @@ class MainWindow(QMainWindow):
             }
         """)
 
-        self.change_folder_btn = QPushButton("Открыть другой проект")
+        self.change_folder_btn = QPushButton(tr("change_folder"))
         self.change_folder_btn.setStyleSheet("""
             QPushButton {
                 background: transparent;
@@ -248,7 +262,7 @@ class MainWindow(QMainWindow):
         """)
         self.change_folder_btn.clicked.connect(self._choose_folder)
 
-        self.exit_btn = QPushButton("✕ Выход")
+        self.exit_btn = QPushButton(tr("exit_btn"))
         self.exit_btn.setStyleSheet("""
             QPushButton {
                 background: transparent;
@@ -264,10 +278,22 @@ class MainWindow(QMainWindow):
         """)
         self.exit_btn.clicked.connect(self.close)
 
+        self.recent_btn = QPushButton(tr("recent_btn"))
+        self.recent_btn.setStyleSheet(self.change_folder_btn.styleSheet())
+        self.recent_menu = QMenu(self)
+        self.recent_menu.aboutToShow.connect(self._fill_recent_menu)
+        self.recent_btn.setMenu(self.recent_menu)
+
+        self.settings_btn = QPushButton(tr("settings_btn"))
+        self.settings_btn.setStyleSheet(self.change_folder_btn.styleSheet())
+        self.settings_btn.clicked.connect(self._open_settings)
+
         top_layout.addWidget(self.folder_icon)
         top_layout.addWidget(self.folder_label)
         top_layout.addStretch()
+        top_layout.addWidget(self.recent_btn)
         top_layout.addWidget(self.change_folder_btn)
+        top_layout.addWidget(self.settings_btn)
         top_layout.addWidget(self.exit_btn)
         content_layout.addLayout(top_layout)
 
@@ -278,7 +304,7 @@ class MainWindow(QMainWindow):
         loading_layout.setAlignment(Qt.AlignCenter)
         loading_layout.setSpacing(20)
 
-        self.loading_label = QLabel("⏳  Сканирование файловой системы...")
+        self.loading_label = QLabel(tr("loading_initial"))
         self.loading_label.setAlignment(Qt.AlignCenter)
         self.loading_label.setStyleSheet("""
             QLabel {
@@ -292,7 +318,7 @@ class MainWindow(QMainWindow):
         """)
         loading_layout.addWidget(self.loading_label)
 
-        self.cancel_scan_btn = QPushButton("✕ Отменить сканирование")
+        self.cancel_scan_btn = QPushButton(tr("cancel_scan"))
         self.cancel_scan_btn.setStyleSheet("""
             QPushButton {
                 background-color: #FFFFFF;
@@ -313,7 +339,7 @@ class MainWindow(QMainWindow):
         self.tree_stack.addWidget(loading_page)
 
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["Файлы и папки"])
+        self.tree.setHeaderLabels([tr("tree_header")])
         self.tree.header().setSectionResizeMode(QHeaderView.Stretch)
         self.tree.header().setVisible(False)
         self.tree.setAlternatingRowColors(True)
@@ -328,22 +354,29 @@ class MainWindow(QMainWindow):
         content_layout.addWidget(self.tree_stack)
 
         btn_layout = QHBoxLayout()
-        self.select_all_btn = QPushButton("✓ Выделить всё")
+        self.select_all_btn = QPushButton(tr("select_all"))
         self.select_all_btn.setStyleSheet(SECONDARY_BTN_STYLE)
         self.select_all_btn.clicked.connect(self._select_all)
-        self.deselect_all_btn = QPushButton("✕ Снять всё")
+        self.deselect_all_btn = QPushButton(tr("deselect_all"))
         self.deselect_all_btn.setStyleSheet(SECONDARY_BTN_STYLE)
         self.deselect_all_btn.clicked.connect(self._deselect_all)
-        self.update_gitignore_btn = QPushButton("Обновить .gitignore")
+        self.update_gitignore_btn = QPushButton(tr("update_gitignore"))
         self.update_gitignore_btn.setStyleSheet(SECONDARY_BTN_STYLE)
         self.update_gitignore_btn.clicked.connect(self._update_gitignore)
-        self.rules_btn = QPushButton("Правила")
+        self.rules_btn = QPushButton(tr("rules_btn"))
         self.rules_btn.setStyleSheet(SECONDARY_BTN_STYLE)
         self.rules_btn.clicked.connect(self._edit_rules)
-        self.merge_all_btn = QPushButton("Собрать весь проект")
+        self.sanitize_checkbox = QCheckBox(tr("sanitize_checkbox"))
+        self.sanitize_checkbox.setToolTip(tr("sanitize_tooltip"))
+        self.sanitize_checkbox.setStyleSheet(
+            "QCheckBox { font-size: 13px; font-family: 'Segoe UI', system-ui, sans-serif; color: #212121; }"
+        )
+        self.sanitize_checkbox.setChecked(self.config.sanitize_secrets)
+        self.sanitize_checkbox.toggled.connect(self._on_sanitize_toggled)
+        self.merge_all_btn = QPushButton(tr("merge_all"))
         self.merge_all_btn.setStyleSheet(BTN_STYLE)
         self.merge_all_btn.clicked.connect(self._merge_all)
-        self.merge_selected_btn = QPushButton("Собрать выбранное")
+        self.merge_selected_btn = QPushButton(tr("merge_selected"))
         self.merge_selected_btn.setStyleSheet(BTN_STYLE)
         self.merge_selected_btn.clicked.connect(self._merge_selected)
 
@@ -352,6 +385,7 @@ class MainWindow(QMainWindow):
         btn_layout.addWidget(self.update_gitignore_btn)
         btn_layout.addWidget(self.rules_btn)
         btn_layout.addStretch()
+        btn_layout.addWidget(self.sanitize_checkbox)
         btn_layout.addWidget(self.merge_all_btn)
         btn_layout.addWidget(self.merge_selected_btn)
         content_layout.addLayout(btn_layout)
@@ -359,7 +393,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(content)
         main_layout.addWidget(self.stack)
 
-        self.statusBar().showMessage("Готов")
+        self.statusBar().showMessage(tr("status_ready"))
         self.statusBar().setStyleSheet("""
             QStatusBar {
                 background: #F5F5F5;
@@ -399,6 +433,7 @@ class MainWindow(QMainWindow):
 
         self.root_path = Path(dir_path)
         self.config.last_source_dir = str(self.root_path)  # deferred save — no disk write here
+        self.config.add_recent_project(str(self.root_path))
         self.folder_label.setText(str(self.root_path))
         t1 = time.perf_counter()
 
@@ -411,8 +446,8 @@ class MainWindow(QMainWindow):
         if spec is None:
             reply = QMessageBox.question(
                 self,
-                ".gitignore не найден",
-                "Файл .gitignore отсутствует. Создать его с типовыми исключениями?",
+                tr("gitignore_missing_title"),
+                tr("gitignore_missing_text"),
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.Yes,
             )
@@ -426,7 +461,7 @@ class MainWindow(QMainWindow):
 
     def _choose_folder(self) -> None:
         dir_path = QFileDialog.getExistingDirectory(
-            self, "Выберите корневую папку проекта", self.config.last_source_dir
+            self, tr("choose_folder_dialog"), self.config.last_source_dir
         )
         if not dir_path:
             return
@@ -441,8 +476,8 @@ class MainWindow(QMainWindow):
 
         self.stack.setCurrentIndex(PAGE_CONTENT)
         self.tree_stack.setCurrentIndex(TREE_PAGE_LOADING)
-        self.loading_label.setText("⏳  Сканирование файловой системы...")
-        self.statusBar().showMessage("Сканирование файлов...")
+        self.loading_label.setText(tr("loading_initial"))
+        self.statusBar().showMessage(tr("status_scanning_files"))
         self._set_controls_enabled(False)
 
         self.scan_worker = ScanWorker(self.root_path, self.combined_spec, parent=self)
@@ -473,19 +508,19 @@ class MainWindow(QMainWindow):
     def _cancel_scan(self) -> None:
         logger.info("Scan cancelled by user")
         self._stop_scan_worker()
-        self.statusBar().showMessage("Сканирование отменено")
+        self.statusBar().showMessage(tr("status_scan_cancelled"))
         self.stack.setCurrentIndex(PAGE_DROP)
 
     def _on_scan_progress(self, count: int, rel_path: str) -> None:
-        self.loading_label.setText(f"⏳  Сканирование: {count} элементов...")
-        self.statusBar().showMessage(f"Сканирование: {rel_path}  ({count})")
+        self.loading_label.setText(tr("loading_progress", count=count))
+        self.statusBar().showMessage(tr("status_scanning", path=rel_path, count=count))
 
     def _on_scan_failed(self, message: str) -> None:
         self._release_scan_worker()
         self._set_controls_enabled(True)
-        self.statusBar().showMessage("Ошибка сканирования")
+        self.statusBar().showMessage(tr("status_scan_error"))
         self.stack.setCurrentIndex(PAGE_DROP)
-        QMessageBox.critical(self, "Ошибка сканирования", message)
+        QMessageBox.critical(self, tr("scan_error_title"), message)
 
     def _release_scan_worker(self) -> None:
         """Drop the worker reference only after the thread fully exited.
@@ -503,7 +538,7 @@ class MainWindow(QMainWindow):
         self._populate_tree(fs_root)
         self.tree_stack.setCurrentIndex(TREE_PAGE_TREE)
         self._set_controls_enabled(True)
-        self.statusBar().showMessage(f"Загружен проект: {self.root_path}  ({count} элементов)")
+        self.statusBar().showMessage(tr("status_loaded", path=self.root_path, count=count))
 
     # ───────── Tree population ─────────
 
@@ -629,67 +664,115 @@ class MainWindow(QMainWindow):
         selected = set(self.selected_paths)
         logger.info("Merge selected: %d files", len(selected))
         if not selected:
-            QMessageBox.warning(self, "Нет файлов", "Не выбрано ни одного файла.")
+            QMessageBox.warning(self, tr("no_files_title"), tr("no_files_text"))
             return
         self._run_merger(spec=self.combined_spec, selected=selected)
 
     def _run_merger(self, spec, selected: set[str]) -> None:
         if self.root_path is None:
-            QMessageBox.warning(self, "Ошибка", "Сначала выберите папку проекта.")
+            QMessageBox.warning(self, tr("err_title"), tr("no_project_first"))
             return
         if self.merge_worker is not None and self.merge_worker.isRunning():
-            QMessageBox.warning(self, "Занято", "Генерация уже выполняется. Дождитесь завершения.")
+            QMessageBox.warning(self, tr("busy_title"), tr("busy_text"))
             return
 
         save_path, _ = QFileDialog.getSaveFileName(
             self,
-            "Сохранить project_merged.md",
+            tr("save_dialog_title"),
             str(Path(self.config.last_output_dir) / "project_merged.md"),
-            "Markdown (*.md)",
+            tr("save_dialog_filter"),
         )
         if not save_path:
             return
         output = Path(save_path)
         self.config.last_output_dir = str(output.parent)
+        self.last_output_path = output
 
-        self.statusBar().showMessage("Сборка проекта...")
+        self.statusBar().showMessage(tr("status_merge_running"))
         self._set_merge_buttons_enabled(False)
-        self.merge_worker = MergerWorker(self.root_path, spec, selected, output, parent=self)
+        self.merge_worker = MergerWorker(
+            self.root_path,
+            spec,
+            selected,
+            output,
+            sanitize=self.sanitize_checkbox.isChecked(),
+            max_file_size_kb=self.config.max_file_size_kb,
+            parent=self,
+        )
         self.merge_worker.merge_done.connect(self._on_merge_done)
         self.merge_worker.merge_failed.connect(self._on_merge_failed)
         self.merge_worker.merge_progress.connect(self._on_merge_progress)
         self.merge_worker.start()
 
     def _on_merge_progress(self, index: int, rel_path: str) -> None:
-        self.statusBar().showMessage(f"Сборка: {rel_path}  ({index})")
+        self.statusBar().showMessage(tr("status_merging", path=rel_path, index=index))
 
     def _release_merge_worker(self) -> None:
         if self.merge_worker is not None:
             self.merge_worker.wait(2000)
             self.merge_worker = None
 
-    def _on_merge_done(self, file_count: int) -> None:
+    def _on_merge_done(self, result: MergeResult) -> None:
         self._release_merge_worker()
         self._set_merge_buttons_enabled(True)
-        self.statusBar().showMessage(f"Готово. Обработано файлов: {file_count}")
-        QMessageBox.information(self, "Успех", f"Файл сохранён.\nФайлов обработано: {file_count}")
+        self.statusBar().showMessage(tr("status_done", count=result.files_written))
+        self._show_merge_report(result)
+
+    def _show_merge_report(self, result: MergeResult) -> None:
+        lines = [tr("success_text", count=result.files_written)]
+        if result.total_chars:
+            lines.append(tr("success_tokens", tokens=f"{result.token_estimate:,}".replace(",", " ")))
+        if result.sanitized:
+            if result.findings_count:
+                lines.append("")
+                lines.append(tr("sanitize_summary", n=result.findings_count, m=len(result.findings)))
+                lines.append(tr("sanitize_disclaimer"))
+            else:
+                lines.append("")
+                lines.append(tr("sanitize_none"))
+
+        box = QMessageBox(QMessageBox.Information, tr("success_title"), "\n".join(lines), parent=self)
+        if result.findings:
+            details: list[str] = []
+            for rel_path, findings in result.findings.items():
+                details.append(rel_path)
+                for f in findings:
+                    details.append(f"    {f.rule} — line {f.line}")
+            box.setDetailedText("\n".join(details))
+        copy_button = box.addButton(tr("copy_btn"), QMessageBox.ActionRole)
+        box.addButton(QMessageBox.Ok)
+        box.setDefaultButton(QMessageBox.Ok)
+        box.exec()
+        if box.clickedButton() is copy_button:
+            self._copy_output_to_clipboard()
+
+    def _copy_output_to_clipboard(self) -> None:
+        if self.last_output_path is None:
+            return
+        try:
+            text = self.last_output_path.read_text(encoding="utf-8")
+        except OSError as e:
+            QMessageBox.critical(self, tr("err_title"), str(e))
+            return
+        QGuiApplication.clipboard().setText(text)
+        self.statusBar().showMessage(tr("status_copied"))
 
     def _on_merge_failed(self, message: str) -> None:
         self._release_merge_worker()
         self._set_merge_buttons_enabled(True)
-        self.statusBar().showMessage("Ошибка")
-        QMessageBox.critical(self, "Ошибка", message)
+        self.statusBar().showMessage(tr("status_error"))
+        QMessageBox.critical(self, tr("err_title"), message)
 
     # ───────── Rules / .gitignore ─────────
 
     def _update_gitignore(self) -> None:
         if self.root_path is None:
-            QMessageBox.warning(self, "Ошибка", "Сначала выберите папку проекта.")
+            QMessageBox.warning(self, tr("err_title"), tr("no_project_first"))
             return
 
         gitignore_path = self.root_path / ".gitignore"
         if not gitignore_path.is_file():
-            QMessageBox.warning(self, "Файл не найден", ".gitignore отсутствует в корне проекта.")
+            QMessageBox.warning(self, tr("file_not_found_title"), tr("gitignore_absent_text"))
             return
 
         existing_patterns: set[str] = set()
@@ -700,7 +783,7 @@ class MainWindow(QMainWindow):
                     if stripped and not stripped.startswith("#"):
                         existing_patterns.add(stripped)
         except OSError as e:
-            QMessageBox.critical(self, "Ошибка", f"Не удалось прочитать .gitignore:\n{e}")
+            QMessageBox.critical(self, tr("err_title"), tr("gitignore_read_error", error=e))
             return
 
         new_patterns = [
@@ -708,7 +791,7 @@ class MainWindow(QMainWindow):
             if p not in existing_patterns
         ]
         if not new_patterns:
-            QMessageBox.information(self, "Готово", "Все правила из шаблона уже присутствуют в .gitignore.")
+            QMessageBox.information(self, tr("done_title"), tr("gitignore_all_present"))
             return
 
         try:
@@ -717,14 +800,14 @@ class MainWindow(QMainWindow):
                 for pattern in new_patterns:
                     f.write(f"{pattern}\n")
         except OSError as e:
-            QMessageBox.critical(self, "Ошибка", f"Не удалось записать .gitignore:\n{e}")
+            QMessageBox.critical(self, tr("err_title"), tr("gitignore_write_error", error=e))
             return
 
         self.combined_spec = get_combined_spec(self.root_path, self.config.gitignore_patterns)
-        self.statusBar().showMessage(".gitignore обновлён")
+        self.statusBar().showMessage(tr("status_gitignore_updated"))
         QMessageBox.information(
-            self, "Готово",
-            f"Добавлены правила исключений в .gitignore ({len(new_patterns)} шт.)."
+            self, tr("done_title"),
+            tr("gitignore_added", count=len(new_patterns)),
         )
         self._start_scan()
 
@@ -735,7 +818,7 @@ class MainWindow(QMainWindow):
         self.config.set_gitignore_patterns(dialog.get_patterns())
         if self.root_path is not None:
             self.combined_spec = get_combined_spec(self.root_path, self.config.gitignore_patterns)
-            self.statusBar().showMessage("Правила обновлены")
+            self.statusBar().showMessage(tr("status_rules_updated"))
             self._start_scan()
 
     # ───────── Misc ─────────
@@ -757,6 +840,64 @@ class MainWindow(QMainWindow):
 
     def _update_buttons(self) -> None:
         self._set_controls_enabled(self.root_path is not None)
+
+    # ───────── v3 options ─────────
+
+    def _on_sanitize_toggled(self, checked: bool) -> None:
+        self.config.sanitize_secrets = checked  # deferred save
+
+    def _fill_recent_menu(self) -> None:
+        self.recent_menu.clear()
+        recent = self.config.recent_projects
+        if not recent:
+            action = self.recent_menu.addAction(tr("recent_empty"))
+            action.setEnabled(False)
+            return
+        for path in recent:
+            action = self.recent_menu.addAction(path)
+            action.triggered.connect(lambda checked=False, p=path: self._open_recent(p))
+
+    def _open_recent(self, path: str) -> None:
+        if not Path(path).is_dir():
+            self.config.remove_recent_project(path)
+            QMessageBox.warning(self, tr("recent_missing_title"), tr("recent_missing_text", path=path))
+            return
+        self._load_project(path)
+
+    def _open_settings(self) -> None:
+        dialog = SettingsDialog(self.config.language, self.config.max_file_size_kb, self)
+        if dialog.exec() != SettingsDialog.Accepted:
+            return
+        self.config.max_file_size_kb = dialog.get_max_file_size_kb()
+        new_lang = dialog.get_language()
+        if new_lang != self.config.language:
+            self.config.language = new_lang
+            i18n.set_language(new_lang)
+            self._retranslate()
+        self.config.flush()
+
+    def _retranslate(self) -> None:
+        """Re-apply all static UI texts after a language switch."""
+        self.setWindowTitle(tr("app_title"))
+        self.drop_zone.retranslate()
+        if self.root_path is None:
+            self.folder_label.setText(tr("no_project"))
+        self.recent_btn.setText(tr("recent_btn"))
+        self.change_folder_btn.setText(tr("change_folder"))
+        self.settings_btn.setText(tr("settings_btn"))
+        self.exit_btn.setText(tr("exit_btn"))
+        self.loading_label.setText(tr("loading_initial"))
+        self.cancel_scan_btn.setText(tr("cancel_scan"))
+        self.tree.setHeaderLabels([tr("tree_header")])
+        self.select_all_btn.setText(tr("select_all"))
+        self.deselect_all_btn.setText(tr("deselect_all"))
+        self.update_gitignore_btn.setText(tr("update_gitignore"))
+        self.rules_btn.setText(tr("rules_btn"))
+        self.sanitize_checkbox.setText(tr("sanitize_checkbox"))
+        self.sanitize_checkbox.setToolTip(tr("sanitize_tooltip"))
+        self.merge_all_btn.setText(tr("merge_all"))
+        self.merge_selected_btn.setText(tr("merge_selected"))
+        self.statusBar().showMessage(tr("status_ready"))
 
     def closeEvent(self, event) -> None:
         self._stop_scan_worker()

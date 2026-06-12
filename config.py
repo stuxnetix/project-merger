@@ -71,7 +71,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "user_gitignore_patterns": [],
     # Built-in defaults the user explicitly removed in the rules dialog.
     "removed_default_patterns": [],
+    "language": "ru",                # UI language: "ru" | "en"
+    "sanitize_secrets": False,       # "Очистить секреты" checkbox state
+    "max_file_size_kb": 0,           # 0 = no limit
+    "recent_projects": [],           # most recent first, capped
 }
+
+MAX_RECENT_PROJECTS = 7
 
 CONFIG_PATH = Path.home() / ".project_merger_config.json"
 
@@ -193,3 +199,57 @@ class Config:
             p for p in DEFAULT_GITIGNORE_PATTERNS if p not in set(wanted)
         ]
         self.save()
+
+    # ───────── v3 options ─────────
+
+    @property
+    def language(self) -> str:
+        lang = self.data.get("language", "ru")
+        return lang if lang in ("ru", "en") else "ru"
+
+    @language.setter
+    def language(self, value: str) -> None:
+        if self.data.get("language") != value:
+            self.data["language"] = value
+            self._dirty = True
+
+    @property
+    def sanitize_secrets(self) -> bool:
+        return bool(self.data.get("sanitize_secrets", False))
+
+    @sanitize_secrets.setter
+    def sanitize_secrets(self, value: bool) -> None:
+        if self.data.get("sanitize_secrets") != bool(value):
+            self.data["sanitize_secrets"] = bool(value)
+            self._dirty = True
+
+    @property
+    def max_file_size_kb(self) -> int:
+        try:
+            return max(0, int(self.data.get("max_file_size_kb", 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    @max_file_size_kb.setter
+    def max_file_size_kb(self, value: int) -> None:
+        value = max(0, int(value))
+        if self.data.get("max_file_size_kb") != value:
+            self.data["max_file_size_kb"] = value
+            self._dirty = True
+
+    @property
+    def recent_projects(self) -> list[str]:
+        items = self.data.get("recent_projects", [])
+        return [str(x) for x in items] if isinstance(items, list) else []
+
+    def add_recent_project(self, path: str) -> None:
+        items = [x for x in self.recent_projects if x != path]
+        items.insert(0, path)
+        self.data["recent_projects"] = items[:MAX_RECENT_PROJECTS]
+        self._dirty = True
+
+    def remove_recent_project(self, path: str) -> None:
+        items = [x for x in self.recent_projects if x != path]
+        if items != self.recent_projects:
+            self.data["recent_projects"] = items
+            self._dirty = True
