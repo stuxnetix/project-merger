@@ -81,6 +81,7 @@ class Config:
 
     def __init__(self, path: Path = CONFIG_PATH) -> None:
         self.path = path
+        self._dirty = False
         self.data: dict[str, Any] = {
             k: v.copy() if isinstance(v, list) else v
             for k, v in DEFAULT_CONFIG.items()
@@ -108,9 +109,22 @@ class Config:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(self.data, f, indent=2, ensure_ascii=False)
             tmp_path.replace(self.path)
+            self._dirty = False
             logger.debug("Config saved to %s", self.path)
         except OSError as e:
             logger.error("Failed to save config: %s", e)
+
+    def flush(self) -> None:
+        """Write pending changes to disk, if any.
+
+        Directory setters only mark the config dirty instead of writing
+        immediately: a synchronous write to the user's home directory (which
+        on Windows is often OneDrive-synced and watched by Defender) can stall
+        for seconds, and it used to happen right on the folder-selection click
+        path. Call ``flush()`` off the hot path (app exit, dialog close).
+        """
+        if self._dirty:
+            self.save()
 
     def _migrate_legacy_rules(self) -> None:
         """Migrate configs from versions that stored the *full* rule list.
@@ -142,8 +156,9 @@ class Config:
 
     @last_source_dir.setter
     def last_source_dir(self, value: str) -> None:
-        self.data["last_source_dir"] = value
-        self.save()
+        if self.data.get("last_source_dir") != value:
+            self.data["last_source_dir"] = value
+            self._dirty = True  # written later via flush() — no disk I/O here
 
     @property
     def last_output_dir(self) -> str:
@@ -151,8 +166,9 @@ class Config:
 
     @last_output_dir.setter
     def last_output_dir(self, value: str) -> None:
-        self.data["last_output_dir"] = value
-        self.save()
+        if self.data.get("last_output_dir") != value:
+            self.data["last_output_dir"] = value
+            self._dirty = True  # written later via flush() — no disk I/O here
 
     # ───────── exclusion rules ─────────
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
@@ -393,13 +394,20 @@ class MainWindow(QMainWindow):
 
     def _load_project(self, dir_path: str) -> None:
         logger.info("Loading project: %s", dir_path)
+        t0 = time.perf_counter()
         self._stop_scan_worker()
 
         self.root_path = Path(dir_path)
-        self.config.last_source_dir = str(self.root_path)
+        self.config.last_source_dir = str(self.root_path)  # deferred save — no disk write here
         self.folder_label.setText(str(self.root_path))
+        t1 = time.perf_counter()
 
         spec = get_gitignore_spec(self.root_path)
+        t2 = time.perf_counter()
+        logger.info(
+            "perf: pre-scan prepare %.0f ms, .gitignore check %.0f ms",
+            (t1 - t0) * 1000, (t2 - t1) * 1000,
+        )
         if spec is None:
             reply = QMessageBox.question(
                 self,
@@ -445,9 +453,22 @@ class MainWindow(QMainWindow):
 
     def _stop_scan_worker(self) -> None:
         if self.scan_worker is not None:
-            self.scan_worker.cancel()
-            self.scan_worker.wait(5000)
-            self.scan_worker = None
+            worker, self.scan_worker = self.scan_worker, None
+            self._shutdown_worker(worker, "scan")
+
+    @staticmethod
+    def _shutdown_worker(worker, name: str) -> None:
+        """Stop a worker thread, escalating to terminate() as a last resort.
+
+        A QThread still alive at window destruction keeps the Python process
+        running — on Windows that leaves a zombie console window that the user
+        cannot close normally.
+        """
+        worker.cancel()
+        if not worker.wait(3000):
+            logger.warning("%s worker did not stop in time — terminating", name)
+            worker.terminate()
+            worker.wait(1000)
 
     def _cancel_scan(self) -> None:
         logger.info("Scan cancelled by user")
@@ -460,14 +481,25 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Сканирование: {rel_path}  ({count})")
 
     def _on_scan_failed(self, message: str) -> None:
-        self.scan_worker = None
+        self._release_scan_worker()
         self._set_controls_enabled(True)
         self.statusBar().showMessage("Ошибка сканирования")
         self.stack.setCurrentIndex(PAGE_DROP)
         QMessageBox.critical(self, "Ошибка сканирования", message)
 
+    def _release_scan_worker(self) -> None:
+        """Drop the worker reference only after the thread fully exited.
+
+        The done/failed signals are delivered while ``run()`` may still be
+        returning; waiting here guarantees no QThread is alive when the window
+        is later destroyed.
+        """
+        if self.scan_worker is not None:
+            self.scan_worker.wait(2000)
+            self.scan_worker = None
+
     def _on_scan_done(self, fs_root: FsNode, count: int) -> None:
-        self.scan_worker = None
+        self._release_scan_worker()
         self._populate_tree(fs_root)
         self.tree_stack.setCurrentIndex(TREE_PAGE_TREE)
         self._set_controls_enabled(True)
@@ -631,14 +663,19 @@ class MainWindow(QMainWindow):
     def _on_merge_progress(self, index: int, rel_path: str) -> None:
         self.statusBar().showMessage(f"Сборка: {rel_path}  ({index})")
 
+    def _release_merge_worker(self) -> None:
+        if self.merge_worker is not None:
+            self.merge_worker.wait(2000)
+            self.merge_worker = None
+
     def _on_merge_done(self, file_count: int) -> None:
-        self.merge_worker = None
+        self._release_merge_worker()
         self._set_merge_buttons_enabled(True)
         self.statusBar().showMessage(f"Готово. Обработано файлов: {file_count}")
         QMessageBox.information(self, "Успех", f"Файл сохранён.\nФайлов обработано: {file_count}")
 
     def _on_merge_failed(self, message: str) -> None:
-        self.merge_worker = None
+        self._release_merge_worker()
         self._set_merge_buttons_enabled(True)
         self.statusBar().showMessage("Ошибка")
         QMessageBox.critical(self, "Ошибка", message)
@@ -723,7 +760,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._stop_scan_worker()
-        if self.merge_worker is not None and self.merge_worker.isRunning():
-            self.merge_worker.cancel()
-            self.merge_worker.wait(5000)
+        if self.merge_worker is not None:
+            worker, self.merge_worker = self.merge_worker, None
+            self._shutdown_worker(worker, "merge")
+        self.config.flush()  # persist deferred changes (last dirs)
         event.accept()

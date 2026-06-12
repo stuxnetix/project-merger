@@ -21,6 +21,7 @@
 ```
 project-merger/
 ├── main.py                  # Точка входа: настройка логирования и запуск приложения
+├── ProjectMerger.pyw        # Запуск на Windows без окна терминала (pythonw)
 ├── config.py                # Настройки (JSON): директории, правила исключений + миграция
 ├── gitignore_handler.py     # Поиск, создание и парсинг .gitignore через pathspec
 ├── scanner.py               # Быстрый обход ФС (os.scandir) с отсечением исключённых папок
@@ -60,6 +61,14 @@ pip install -r requirements.txt
 ```
 
 ## Запуск
+
+### Windows — без окна терминала (рекомендуется)
+
+Двойной щелчок по **`ProjectMerger.pyw`** — запустится только GUI, без консоли.
+Можно создать ярлык на этот файл на рабочем столе. Все сообщения по-прежнему
+пишутся в `project_merger.log` рядом со скриптом.
+
+### Из терминала
 
 ```bash
 python main.py            # Windows
